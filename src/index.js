@@ -155,16 +155,21 @@ const DEBT_FORM_KEY_ALIASES = new Map([
   ['musteri', 'customer_name'],
   ['kreditin meblegi', 'loan_amount'],
   ['kredit meblegi', 'loan_amount'],
+  ['kredit', 'loan_amount'],
+  ['mebleg', 'loan_amount'],
   ['kreditin muddeti', 'loan_term'],
   ['muddet', 'loan_term'],
   ['odenis tarixi', 'payment_date'],
   ['odenis gunu', 'payment_date'],
+  ['tarix', 'payment_date'],
   ['qaliq borcun meblegi', 'outstanding_amount'],
   ['qaliq borc', 'outstanding_amount'],
   ['borc meblegi', 'outstanding_amount'],
+  ['qaliq', 'outstanding_amount'],
   ['kredit muqavilesi', 'contract_number'],
   ['muqavile nomresi', 'contract_number'],
   ['muqavile', 'contract_number'],
+  ['contract', 'contract_number'],
   ['qeyd', 'note'],
   ['note', 'note'],
 ]);
@@ -173,10 +178,23 @@ const REQUEST_ID_REGEX = /(sor[uğ]u\s*id|request\s*id|req\s*id)[:#\s-]*([0-9a-f
 const UUID_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 const TELEGRAM_HELP_TEXT = [
-  'Sorğunu yeniləmək üçün:',
-  '1) Botun göndərdiyi mesaja cavab olaraq məlumatları paylaşın və formatı qoruyun.',
-  '2) Və ya /submit <sorğu-id> yazıb altında məlumat blokunu göndərin.',
-  'Format nümunəsi:\nad: Məmmədov Ceyhun\nKreditin məbləği: 70 ₼\nKreditin müddəti: 10 gün\nÖdəniş tarixi: 11.03.2024\nQalıq borcun məbləği: 147 ₼\nKredit müqaviləsi: №A2403010000736025329',
+  'Sorğunu yeniləmək üçün iki seçim var:',
+  '• Botun göndərdiyi mesaja cavab yazın və məlumatları eyni mesajda paylaşın;',
+  '• və ya /submit <sorğu-id> yazıb ardınca məlumatları əlavə edin.',
+  '',
+  '3 forma dəstəklənir:',
+  '1) Qısa açarlar: ad=..., kredit=..., muddet=..., tarix=..., qaliq=..., muqavile=...;',
+  '2) Klassik format: "ad: ..." sətirlərini yazın;',
+  '3) Ən sadə şablon: 6 sətir ardıcıl göndərin → ad, məbləğ, müddət, tarix, qalıq, müqavilə (əlavə qeydlər varsa yeni sətirə).',
+  '',
+  'Ayrıcı olaraq ; və ya yeni sətr istifadə etmək olar.',
+  '',
+  'Nümunə:',
+  'Məmmədov Ceyhun\n70 ₼\n10 gün\n11.03.2024\n147 ₼\n№A2403010000736025329\n',
+  'və ya',
+  'ad=Məmmədov Ceyhun; kredit=70 ₼; muddet=10 gün; tarix=11.03.2024; qaliq=147 ₼; muqavile=№A2403010000736025329',
+  '',
+  'Tez şablon lazımdırsa /template <sorğu-id> yazın.',
 ].join('\n');
 
 function filterAllowedFields(obj) {
@@ -376,14 +394,17 @@ function normalizeFormKey(key = '') {
 
 function parseDebtDetailsForm(text = '') {
   if (!text) return {};
-  const lines = text.split(/\r?\n/);
+  const normalizedInput = text
+    .replace(/[;|]/g, '\n')
+    .replace(/\r/g, '\n');
+  const lines = normalizedInput.split(/\n/);
   const collected = {};
   let currentKey = null;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
-    const match = line.match(/^([^:]+):\s*(.*)$/);
+    const match = line.match(/^([^:=\-]+)\s*[:=\-]\s*(.*)$/);
     if (match) {
       const normalizedKey = normalizeFormKey(match[1]);
       if (!normalizedKey) {
@@ -407,6 +428,22 @@ function parseDebtDetailsForm(text = '') {
     const canonical = DEBT_FORM_KEY_ALIASES.get(key) || key;
     mapped[canonical] = cleanedValue;
   }
+
+  if (Object.keys(mapped).length === 0) {
+    const simpleLines = lines
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (simpleLines.length >= 5) {
+      const [name, loanAmount, loanTerm, paymentDate, outstanding, contract, ...rest] = simpleLines;
+      if (name) mapped.customer_name = name;
+      if (loanAmount) mapped.loan_amount = loanAmount;
+      if (loanTerm) mapped.loan_term = loanTerm;
+      if (paymentDate) mapped.payment_date = paymentDate;
+      if (outstanding) mapped.outstanding_amount = outstanding;
+      if (contract) mapped.contract_number = contract;
+      if (rest?.length) mapped.note = rest.join(' ');
+    }
+  }
   return mapped;
 }
 
@@ -427,6 +464,20 @@ function parseSubmitCommand(text = '') {
     requestId: match[2],
     body: (match[3] || '').trim(),
   };
+}
+
+function buildDebtTemplate(requestId) {
+  const lines = [
+    requestId ? `Sorğu ID: ${requestId}` : null,
+    'ad: ',
+    'kreditin məbləği: ',
+    'kreditin müddəti: ',
+    'ödəniş tarixi: ',
+    'qaliq borcun məbləği: ',
+    'kredit müqaviləsi: ',
+  ].filter(Boolean);
+  lines.push('', 'Qısa format nümunəsi:', 'ad=Məmmədov Ceyhun; kredit=70 ₼; muddet=10 gün; tarix=11.03.2024; qaliq=147 ₼; muqavile=№A2403010000736025329');
+  return lines.join('\n');
 }
 
 function isAuthorizedChat(chatId) {
@@ -498,6 +549,13 @@ async function handleTelegramUpdate(update = {}) {
     return;
   }
 
+  if (text.startsWith('/template')) {
+    const [, reqIdRaw] = text.split(/\s+/, 2);
+    const template = buildDebtTemplate(reqIdRaw?.trim());
+    await sendToTelegram(template, { chatId, replyToMessageId: message.message_id });
+    return;
+  }
+
   const command = parseSubmitCommand(text);
   let requestId = command?.requestId || null;
   let payloadText = command?.body || '';
@@ -518,7 +576,7 @@ async function handleTelegramUpdate(update = {}) {
   }
 
   if (!payloadText) {
-    await sendToTelegram('Məlumat blokunu eyni mesajda paylaşın.', {
+    await sendToTelegram('Məlumat blokunu eyni mesajda paylaşın. /template əmri ilə tez şablon ala bilərsiniz.', {
       chatId,
       replyToMessageId: message.message_id,
     });
@@ -527,7 +585,7 @@ async function handleTelegramUpdate(update = {}) {
 
   const parsed = parseDebtDetailsForm(payloadText);
   if (!parsed || Object.keys(parsed).length === 0) {
-    await sendToTelegram('Məlumatı oxumaq alınmadı. Zəhmət olmasa "ad:" formatını qoruyun.', {
+    await sendToTelegram('Məlumatı oxumaq alınmadı. "ad=...; kredit=..." formatından istifadə edin və ya /template əmrindən yararlanın.', {
       chatId,
       replyToMessageId: message.message_id,
     });
